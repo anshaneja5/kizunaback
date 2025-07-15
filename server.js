@@ -27,13 +27,15 @@ app.use('/api/auth', authRoutes);
 app.use('/api/analyze', analyzeRoutes);
 app.use('/api/gemini', geminiRoutes);
 
-// MongoDB Connection
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/kinabot', {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-})
-.then(() => console.log('Connected to MongoDB'))
-.catch((err) => console.error('MongoDB connection error:', err));
+// MongoDB Connection (commented out for S3 migration)
+// mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/kinabot', {
+//   useNewUrlParser: true,
+//   useUnifiedTopology: true,
+// })
+// .then(() => console.log('Connected to MongoDB'))
+// .catch((err) => console.error('MongoDB connection error:', err));
+//
+// All persistent storage is now handled by AWS S3.
 
 // Error handling middleware
 app.use((err, req, res, next) => {

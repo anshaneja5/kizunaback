@@ -3,37 +3,14 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const { spawn } = require('child_process');
-const Recording = require('../models/Recording');
+// const Recording = require('../models/Recording'); // Commented out for S3 migration
 const auth = require('../middleware/auth');
 const fs = require('fs');
+const { uploadFileToS3, uploadJsonToS3, getJsonFromS3 } = require('../middleware/s3');
+const AWS = require('aws-sdk');
 
-// Get uploads directory from environment variable or use default
-const uploadsDir = process.env.UPLOADS_DIR || path.join(process.cwd(), 'uploads');
-console.log('Uploads directory path:', uploadsDir);
-console.log('Current working directory:', process.cwd());
-
-if (!fs.existsSync(uploadsDir)) {
-    console.log('Creating uploads directory...');
-    fs.mkdirSync(uploadsDir, { recursive: true });
-    console.log('Uploads directory created successfully');
-} else {
-    console.log('Uploads directory already exists');
-}
-
-// Configure multer for audio file upload
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        console.log('Setting destination to:', uploadsDir);
-        cb(null, uploadsDir);
-    },
-    filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        const filename = uniqueSuffix + path.extname(file.originalname);
-        console.log('Generated filename:', filename);
-        cb(null, filename);
-    }
-});
-
+// Configure multer for in-memory storage
+const storage = multer.memoryStorage();
 const upload = multer({ 
     storage: storage,
     fileFilter: function (req, file, cb) {
@@ -50,16 +27,16 @@ router.post('/audio', auth, upload.single('audio'), async (req, res) => {
             return res.status(400).json({ error: 'No audio file uploaded' });
         }
 
-        const audioPath = req.file.path;
-        console.log('Uploaded file path:', audioPath);
-        console.log('File details:', {
-            originalname: req.file.originalname,
-            filename: req.file.filename,
-            path: req.file.path,
-            size: req.file.size
-        });
+        // Save audio file to S3
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const s3AudioKey = `audio/${req.user.id}/${uniqueSuffix}.wav`;
+        await uploadFileToS3(s3AudioKey, req.file.buffer, req.file.mimetype);
 
-        const pythonProcess = spawn('python', ['analysis/analyze_audio.py', audioPath], {
+        // Save file temporarily for Python analysis
+        const tempPath = path.join(__dirname, `temp-${uniqueSuffix}.wav`);
+        fs.writeFileSync(tempPath, req.file.buffer);
+
+        const pythonProcess = spawn('python', ['analysis/analyze_audio.py', tempPath], {
             stdio: ['pipe', 'pipe', 'pipe']
         });
 
@@ -67,44 +44,22 @@ router.post('/audio', auth, upload.single('audio'), async (req, res) => {
         let errorData = '';
 
         pythonProcess.stdout.on('data', (data) => {
-            console.log('Python stdout:', data.toString());
             analysisData += data.toString();
         });
 
         pythonProcess.stderr.on('data', (data) => {
-            console.error('Python stderr:', data.toString());
             errorData += data.toString();
         });
 
         pythonProcess.on('close', async (code) => {
-            // Clean up the uploaded file after processing
+            fs.unlinkSync(tempPath); // Clean up temp file
             try {
-                console.log('Attempting to delete file:', audioPath);
-                fs.unlinkSync(audioPath);
-                console.log('File deleted successfully');
-            } catch (err) {
-                console.error('Error deleting temporary file:', err);
-            }
-
-            if (code !== 0) {
-                console.error('Python process exited with code:', code);
-                console.error('Error output:', errorData);
-                return res.status(500).json({ 
-                    error: 'Analysis failed', 
-                    details: errorData,
-                    code: code
-                });
-            }
-
-            try {
-                console.log('Raw Python output:', analysisData);
                 const result = JSON.parse(analysisData);
-                console.log('Parsed result:', result);
-                
-                // Save recording to database
-                const recording = new Recording({
+                // Save analysis metadata to S3
+                const s3MetaKey = `audio/${req.user.id}/${uniqueSuffix}.json`;
+                const metadata = {
                     user: req.user.id,
-                    audioFile: req.file.filename,
+                    audioFile: s3AudioKey,
                     transcribedText: result.transcribedText,
                     analysis: {
                         polarityScore: result.polarityScore,
@@ -116,20 +71,17 @@ router.post('/audio', auth, upload.single('audio'), async (req, res) => {
                         conjunctionCount: result.conjunctionCount,
                         diversityFeedback: result.diversityFeedback,
                         complexityFeedback: result.complexityFeedback
-                    }
-                });
-
-                await recording.save();
-                console.log('Recording saved to database with ID:', recording._id);
-
-                // Return both the analysis results and the recording ID
+                    },
+                    createdAt: new Date().toISOString()
+                };
+                await uploadJsonToS3(s3MetaKey, metadata);
+                // Return both the analysis results and the S3 key
                 res.json({
                     ...result,
-                    recordingId: recording._id
+                    s3AudioKey,
+                    s3MetaKey
                 });
             } catch (error) {
-                console.error('Error processing Python output:', error);
-                console.error('Raw output that failed to parse:', analysisData);
                 res.status(500).json({ 
                     error: 'Failed to process analysis results',
                     details: error.message,
@@ -137,31 +89,36 @@ router.post('/audio', auth, upload.single('audio'), async (req, res) => {
                 });
             }
         });
-
-        pythonProcess.on('error', (error) => {
-            console.error('Failed to start Python process:', error);
-            res.status(500).json({ 
-                error: 'Failed to start analysis process',
-                details: error.message
-            });
-        });
-
     } catch (error) {
-        console.error('Error in audio analysis:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: error.message });
     }
 });
 
-// Get user's recordings
+// Get user's recordings from S3
 router.get('/recordings', auth, async (req, res) => {
     try {
-        const recordings = await Recording.find({ user: req.user.id })
-            .sort({ createdAt: -1 })
-            .select('-__v');
-        
-        res.json(recordings);
+        const s3 = new AWS.S3();
+        const prefix = `audio/${req.user.id}/`;
+        const params = {
+            Bucket: 'kinabot-audio-storage',
+            Prefix: prefix,
+        };
+        // List all objects in the user's folder
+        const listed = await s3.listObjectsV2(params).promise();
+        // Filter for .json files (metadata)
+        const jsonFiles = listed.Contents.filter(obj => obj.Key.endsWith('.json'));
+        // Fetch and parse each metadata file
+        const recordings = await Promise.all(jsonFiles.map(async (file) => {
+            try {
+                const meta = await getJsonFromS3(file.Key);
+                return { ...meta, s3MetaKey: file.Key };
+            } catch (e) {
+                return null;
+            }
+        }));
+        res.json(recordings.filter(Boolean));
     } catch (error) {
-        console.error('Error fetching recordings:', error);
+        console.error('Error fetching recordings from S3:', error);
         res.status(500).json({ error: 'Failed to fetch recordings' });
     }
 });
